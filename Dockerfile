@@ -9,9 +9,11 @@ RUN npm run build && npm prune --omit=dev --ignore-scripts
 
 FROM node:22-alpine AS runtime
 WORKDIR /app
-ENV NODE_ENV=production DATA_FILE=/data/users.json
+ENV NODE_ENV=production DATA_FILE=/data/users.json PORT=8080
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+COPY public ./public
 COPY package.json ./
 VOLUME /data
+EXPOSE 8080
 CMD ["node", "dist/index.js"]

@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>AACWorkflow</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; font: 15px/1.45 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+    background: var(--tg-theme-secondary-bg-color, #f0f1f3);
+    color: var(--tg-theme-text-color, #0a0d12);
+    padding: 0 0 env(safe-area-inset-bottom);
+  }
+  header { padding: 16px 16px 8px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 700; }
+  .sub { color: var(--tg-theme-hint-color, #8a8f98); font-size: 13px; margin-top: 2px; }
+  .tabs { display: flex; gap: 6px; padding: 8px 12px; overflow-x: auto; }
+  .tab { white-space: nowrap; padding: 6px 12px; border-radius: 999px; border: none;
+    background: var(--tg-theme-bg-color, #fff); color: var(--tg-theme-text-color, #0a0d12); font-size: 13px; }
+  .tab.active { background: var(--tg-theme-button-color, #2ea6ff); color: var(--tg-theme-button-text-color, #fff); }
+  .list { padding: 8px 12px 96px; display: flex; flex-direction: column; gap: 8px; }
+  .card { background: var(--tg-theme-bg-color, #fff); border-radius: 14px; padding: 12px 14px; display: flex; align-items: center; gap: 10px; }
+  .card .t { flex: 1; min-width: 0; }
+  .card .title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card .meta { color: var(--tg-theme-hint-color, #8a8f98); font-size: 12px; margin-top: 2px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+  .check { width: 26px; height: 26px; border-radius: 50%; border: 2px solid var(--tg-theme-hint-color, #c7cbd1); flex: none; background: none; }
+  .check.done { background: #2ecc71; border-color: #2ecc71; }
+  .empty, .err { text-align: center; color: var(--tg-theme-hint-color, #8a8f98); padding: 48px 24px; }
+  .fab { position: fixed; left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom));
+    height: 50px; border: none; border-radius: 14px; font-size: 16px; font-weight: 600;
+    background: var(--tg-theme-button-color, #2ea6ff); color: var(--tg-theme-button-text-color, #fff); }
+  .skeleton { height: 64px; border-radius: 14px; background: var(--tg-theme-bg-color, #fff); opacity: .6; }
+</style>
+</head>
+<body>
+  <header><h1>AACWorkflow</h1><div class="sub" id="sub">Загрузка…</div></header>
+  <div class="tabs" id="tabs"></div>
+  <div class="list" id="list"><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div></div>
+  <button class="fab" id="add">＋ Новая задача</button>
+
+<script>
+const tg = window.Telegram?.WebApp; tg?.ready(); tg?.expand();
+const INIT = tg?.initData || "";
+const dotColor = s => s==="done"?"#2ecc71":(s==="in_progress"||s==="started")?"#2ea6ff":s==="cancelled"?"#9aa0a6":"#f5a623";
+const prioRu = {urgent:"срочный",high:"высокий",medium:"средний",low:"низкий"};
+const FILTERS = {open:{label:"Открытые",keep:s=>s!=="done"&&s!=="cancelled"},progress:{label:"В работе",keep:s=>s==="in_progress"||s==="started"},done:{label:"Готово",keep:s=>s==="done"},all:{label:"Все",keep:()=>true}};
+let filter="open", tasks=[];
+
+async function api(path, opts={}) {
+  const r = await fetch(path, { method: opts.method||"GET", headers: { "Content-Type":"application/json", "X-Telegram-Init-Data": INIT }, body: opts.body?JSON.stringify(opts.body):undefined });
+  if (!r.ok) throw new Error((await r.json().catch(()=>({}))).message || ("HTTP "+r.status));
+  return r.json();
+}
+function renderTabs(){ const t=document.getElementById("tabs"); t.innerHTML="";
+  Object.entries(FILTERS).forEach(([k,v])=>{ const b=document.createElement("button"); b.className="tab"+(k===filter?" active":""); b.textContent=v.label; b.onclick=()=>{filter=k;render();}; t.appendChild(b); }); }
+function render(){
+  renderTabs();
+  const arr = tasks.filter(i=>FILTERS[filter].keep(i.status||""));
+  document.getElementById("sub").textContent = FILTERS[filter].label+" · "+arr.length;
+  const list=document.getElementById("list"); list.innerHTML="";
+  if(!arr.length){ list.innerHTML='<div class="empty">Здесь пока пусто</div>'; return; }
+  arr.forEach(i=>{
+    const c=document.createElement("div"); c.className="card";
+    const d=document.createElement("span"); d.className="dot"; d.style.background=dotColor(i.status); c.appendChild(d);
+    const t=document.createElement("div"); t.className="t";
+    t.innerHTML='<div class="title"></div><div class="meta"></div>';
+    t.querySelector(".title").textContent=i.title||"—";
+    t.querySelector(".meta").textContent=[i.identifier, prioRu[i.priority]].filter(Boolean).join(" · ")||" ";
+    c.appendChild(t);
+    const ck=document.createElement("button"); ck.className="check"+(i.status==="done"?" done":"");
+    ck.onclick=async(e)=>{ e.stopPropagation(); if(i.status==="done")return; tg?.HapticFeedback?.impactOccurred("light");
+      try{ await api("/api/tasks/"+i.id+"/done",{method:"POST"}); i.status="done"; render(); }catch(err){ tg?.showAlert(String(err.message||err)); } };
+    c.appendChild(ck);
+    list.appendChild(c);
+  });
+}
+function unwrap(d){ return Array.isArray(d)?d:(d.issues||d.data||[]); }
+async function load(){
+  try { tasks = unwrap(await api("/api/tasks")); render(); }
+  catch(e){ document.getElementById("sub").textContent=""; document.getElementById("list").innerHTML='<div class="err">'+(String(e.message||e))+'<br><br>Откройте бота и подключите ключ: /login</div>'; }
+}
+document.getElementById("add").onclick=async()=>{
+  const title = await new Promise(res=>{ if(tg?.showPopup){ tg.showScanQrPopup; } res(prompt("Название задачи")); });
+  if(!title) return; tg?.HapticFeedback?.impactOccurred("light");
+  try{ await api("/api/tasks",{method:"POST",body:{title}}); await load(); }catch(e){ tg?.showAlert(String(e.message||e)); }
+};
+load();
+</script>
+</body>
+</html>

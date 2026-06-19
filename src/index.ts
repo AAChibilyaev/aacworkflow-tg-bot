@@ -10,9 +10,12 @@
 import { Bot, InlineKeyboard, type Context } from "grammy";
 import { aac, resolveWorkspace, serverUrl } from "./aac.js";
 import { getUser, setToken, setWorkspace, setChat, clearUser } from "./store.js";
+import { startWeb } from "./web.js";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? "";
 if (!BOT_TOKEN) { console.error("[tg-bot] TELEGRAM_BOT_TOKEN is not set."); process.exit(1); }
+const WEBAPP_URL = process.env.WEBAPP_URL ?? "";  // public HTTPS url of the mini app (enables the in-Telegram app)
+const PORT = Number(process.env.PORT ?? 8080);
 const bot = new Bot(BOT_TOKEN);
 
 const PAGE = 6;
@@ -66,7 +69,9 @@ async function home(ctx: Context) {
   const token = tokenOf(ctx);
   if (!token) return panel(ctx, head("AACWorkflow") + "\n\n" + quote("Подключите ключ доступа, чтобы управлять задачами и агентами."), new InlineKeyboard().text("🔑 Подключить ключ", "nav:login"));
   const ws = await wsLabel(ctx, token);
-  const kb = new InlineKeyboard()
+  const kb = new InlineKeyboard();
+  if (WEBAPP_URL) kb.webApp("🚀 Открыть приложение", WEBAPP_URL).row();
+  kb
     .text("📋 Задачи", "nav:tasks:0:open").text("🤖 Агенты", "nav:agents").row()
     .text("＋ Новая задача", "nav:new").text("🔍 Поиск", "nav:search").row()
     .text(`🏢 ${cut(ws, 20)}`, "nav:ws").text("👤 Профиль", "nav:me");
@@ -83,10 +88,19 @@ async function tasks(ctx: Context, page = 0, filter = "open") {
     const all = all0.filter((i) => FILTERS[filter].keep(i.status ?? ""));
     const pages = Math.max(1, Math.ceil(all.length / PAGE));
     page = Math.min(Math.max(0, page), pages - 1);
+    const slice = all.slice(page * PAGE, page * PAGE + PAGE);
+    let body = head("Задачи", `${FILTERS[filter].label} · ${all.length}`);
+    if (!all.length) body += "\n\n" + quote("Здесь пока пусто.");
+    else body += "\n\n" + slice.map((i, idx) => {
+      const n = page * PAGE + idx + 1;
+      const pr = i.priority && i.priority !== "no_priority" ? `  ${dim("· " + (PRIO_RU[i.priority] ?? i.priority))}` : "";
+      return `${b(n + ".")} ${dot(i.status)} ${esc(cut(i.title, 48))}${pr}`;
+    }).join("\n");
     const kb = new InlineKeyboard();
+    slice.forEach((i, idx) => { kb.text(String(page * PAGE + idx + 1), `task:${i.id}:${page}:${filter}`); if ((idx + 1) % 3 === 0) kb.row(); });
+    kb.row();
     (Object.keys(FILTERS) as string[]).forEach((f) => kb.text(`${f === filter ? "• " : ""}${FILTERS[f].label}`, `nav:tasks:0:${f}`));
     kb.row();
-    all.slice(page * PAGE, page * PAGE + PAGE).forEach((i) => kb.text(`${dot(i.status)} ${cut(i.title, 40)}`, `task:${i.id}:${page}:${filter}`).row());
     if (pages > 1) {
       if (page > 0) kb.text("‹", `nav:tasks:${page - 1}:${filter}`);
       kb.text(`${page + 1} / ${pages}`, `nav:tasks:${page}:${filter}`);
@@ -95,7 +109,7 @@ async function tasks(ctx: Context, page = 0, filter = "open") {
     }
     kb.text("＋ Новая", "nav:new").text("⟳ Обновить", `nav:tasks:${page}:${filter}`).row();
     backBtn(kb);
-    await panel(ctx, head("Задачи", `${FILTERS[filter].label} · ${all.length}`) + (all.length ? "" : "\n\n" + quote("Здесь пока пусто.")), kb);
+    await panel(ctx, body, kb);
   } catch (e) { await panel(ctx, "⚠️ " + esc(errMsg(e)), new InlineKeyboard().text("‹ Назад", "nav:home")); }
 }
 
@@ -313,6 +327,9 @@ await bot.api.setMyCommands([
   { command: "whoami", description: "Профиль" }, { command: "stop", description: "Выйти из чата" },
   { command: "logout", description: "Отключить ключ" },
 ]);
-await bot.api.setChatMenuButton({ menu_button: { type: "commands" } });
-console.error("[tg-bot] starting (long polling) →", serverUrl);
+if (WEBAPP_URL) await bot.api.setChatMenuButton({ menu_button: { type: "web_app", text: "Приложение", web_app: { url: WEBAPP_URL } } });
+else await bot.api.setChatMenuButton({ menu_button: { type: "commands" } });
+
+startWeb(BOT_TOKEN, PORT);
+console.error("[tg-bot] starting (long polling) →", serverUrl, WEBAPP_URL ? `· mini-app ${WEBAPP_URL}` : "");
 await bot.start();
