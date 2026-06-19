@@ -11,7 +11,9 @@
  */
 import { Bot, InlineKeyboard, Keyboard, type Context } from "grammy";
 import { aac, resolveWorkspace, serverUrl } from "./aac.js";
-import { getUser, setToken, setWorkspace, clearUser } from "./store.js";
+import { getUser, setToken, setWorkspace, setChat, clearUser } from "./store.js";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? "";
 if (!BOT_TOKEN) { console.error("[tg-bot] TELEGRAM_BOT_TOKEN is not set. Create a bot with @BotFather."); process.exit(1); }
@@ -84,8 +86,10 @@ async function viewAgents(ctx: Context, edit = false) {
     const w = await wsOf(ctx, token);
     const data = await aac(token, "GET", "/api/agents", { workspaceId: w });
     const arr: any[] = Array.isArray(data) ? data : data?.agents ?? data?.data ?? [];
-    const txt = arr.length ? "🤖 *Агенты:*\n" + arr.map((a) => `• *${escape(a.name)}* — ${a.status ?? "?"}`).join("\n") : "🤖 Агентов пока нет.";
-    await show(ctx, txt, new InlineKeyboard().text("🔄", "m:agents").text("⬅️ Меню", "m:home"), edit);
+    const kb = new InlineKeyboard();
+    arr.slice(0, 12).forEach((a) => kb.text(`💬 ${truncate(a.name, 34)}`, `a:chat:${a.id}`).row());
+    kb.text("🔄", "m:agents").text("⬅️ Меню", "m:home");
+    await show(ctx, arr.length ? "🤖 *Агенты* — нажми, чтобы начать чат:" : "🤖 Агентов пока нет.", kb, edit);
   } catch (e) { await show(ctx, "⚠️ " + errText(e), homeKb(), edit); }
 }
 async function viewWorkspaces(ctx: Context, edit = false) {
@@ -126,6 +130,7 @@ bot.command("newtask", async (ctx) => {
   if (!title) { if (ctx.from) pending.set(ctx.from.id, "newtask"); return ctx.reply("✍️ Напиши текст новой задачи одним сообщением:"); }
   await createTask(ctx, title);
 });
+bot.command("stop", (ctx) => { if (ctx.from) setChat(ctx.from.id, undefined); return ctx.reply("💬 Чат с агентом завершён.", { reply_markup: replyKb() }); });
 bot.command("use", (ctx) => { const id = (ctx.match ?? "").trim(); if (id && ctx.from) { setWorkspace(ctx.from.id, id); return ctx.reply("✅ Активная компания: `" + id + "`", { parse_mode: "Markdown" }); } return ctx.reply("Лучше выбери кнопкой: /workspaces"); });
 
 // ── Reply-keyboard buttons ──────────────────────────────────────────────
@@ -149,17 +154,23 @@ bot.on("callback_query:data", async (ctx) => {
     else if (d.startsWith("t:open:")) await viewTask(ctx, d.slice(7), true);
     else if (d.startsWith("t:done:")) { await completeTask(ctx, d.slice(7)); await viewTasks(ctx, true); }
     else if (d.startsWith("ws:")) { if (ctx.from) setWorkspace(ctx.from.id, d.slice(3)); await viewWorkspaces(ctx, true); }
+    else if (d.startsWith("a:chat:")) await startChat(ctx, d.slice(7));
+    else if (d === "m:stop") { if (ctx.from) setChat(ctx.from.id, undefined); await show(ctx, "💬 Чат завершён.", undefined, true); await viewHome(ctx); }
     await ctx.answerCallbackQuery();
   } catch (e) { await ctx.answerCallbackQuery({ text: errText(e).slice(0, 190), show_alert: true }); }
 });
 
 // ── Free text → pending action (login / new task). Runs after the above. ─
 bot.on("message:text", async (ctx) => {
-  const id = ctx.from?.id; const act = id ? pending.get(id) : undefined;
-  if (!act) { return viewHome(ctx); }
-  pending.delete(id!);
-  if (act === "login") await handleToken(ctx, ctx.message.text.trim());
-  else if (act === "newtask") await createTask(ctx, ctx.message.text.trim());
+  const id = ctx.from?.id; if (!id) return;
+  const act = pending.get(id);
+  if (act) {
+    pending.delete(id);
+    if (act === "login") return handleToken(ctx, ctx.message.text.trim());
+    if (act === "newtask") return createTask(ctx, ctx.message.text.trim());
+  }
+  if (getUser(id)?.chat) return chatSend(ctx, ctx.message.text);
+  return viewHome(ctx);
 });
 
 // ── Actions ─────────────────────────────────────────────────────────────
@@ -183,6 +194,47 @@ async function createTask(ctx: Context, title: string) {
       { parse_mode: "Markdown", reply_markup: new InlineKeyboard().text("📋 К задачам", "m:tasks") });
   } catch (e) { await ctx.reply("⚠️ " + errText(e)); }
 }
+async function startChat(ctx: Context, agentId: string) {
+  const token = tokenOf(ctx); if (!token) return viewHome(ctx, true);
+  try {
+    const w = await wsOf(ctx, token);
+    let name = "агент";
+    try { const a = await aac(token, "GET", `/api/agents/${agentId}`, { workspaceId: w }); name = a?.name ?? name; } catch { /* ignore */ }
+    const session = await aac(token, "POST", "/api/chat/sessions", { workspaceId: w, body: { agent_id: agentId, title: "Telegram" } });
+    if (ctx.from) setChat(ctx.from.id, { agentId, sessionId: session.id, agentName: name });
+    await show(ctx, `💬 *Чат с ${escape(name)}*\nПиши сообщение — он ответит. /stop — выйти.`, new InlineKeyboard().text("🛑 Выйти из чата", "m:stop"), true);
+  } catch (e) { await show(ctx, "⚠️ " + errText(e), homeKb(), true); }
+}
+
+async function chatSend(ctx: Context, text: string) {
+  const id = ctx.from?.id; const u = id ? getUser(id) : undefined;
+  if (!u?.chat || !u.token) return viewHome(ctx);
+  const { token } = u; const chat = u.chat;
+  let since = new Date().toISOString();
+  try {
+    const send = await aac(token, "POST", `/api/chat/sessions/${chat.sessionId}/messages`, { workspaceId: await wsOf(ctx, token), body: { content: text } });
+    if (send?.created_at) since = send.created_at;
+  } catch (e) { await ctx.reply("⚠️ " + errText(e)); return; }
+  const thinking = await ctx.reply(`⏳ ${chat.agentName} печатает…`);
+  const w = await wsOf(ctx, token);
+  for (let i = 0; i < 40; i++) {
+    await sleep(2500);
+    try {
+      const msgs = await aac(token, "GET", `/api/chat/sessions/${chat.sessionId}/messages`, { workspaceId: w });
+      const arr: any[] = Array.isArray(msgs) ? msgs : [];
+      const fresh = arr.filter((m) => m.role === "assistant" && (m.created_at ?? "") > since && (m.content ?? "").trim());
+      const failed = arr.find((m) => m.failure_reason && (m.created_at ?? "") >= since);
+      if (fresh.length) {
+        const reply = fresh.map((m) => m.content).join("\n\n").slice(0, 3800);
+        await ctx.api.editMessageText(thinking.chat.id, thinking.message_id, `🤖 ${chat.agentName}:\n\n${reply}`);
+        return;
+      }
+      if (failed) { await ctx.api.editMessageText(thinking.chat.id, thinking.message_id, "⚠️ Агент не смог ответить: " + (failed.failure_reason ?? "")); return; }
+    } catch { /* keep polling */ }
+  }
+  await ctx.api.editMessageText(thinking.chat.id, thinking.message_id, "⌛ Агент пока не ответил. Напиши ещё раз или /stop.");
+}
+
 async function completeTask(ctx: Context, id: string) {
   const token = tokenOf(ctx); if (!token) return;
   const w = await wsOf(ctx, token);

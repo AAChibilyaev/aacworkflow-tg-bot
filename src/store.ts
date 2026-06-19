@@ -3,7 +3,8 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 
-export type UserRec = { token: string; workspaceId?: string };
+export type ChatRec = { agentId: string; sessionId: string; agentName: string };
+export type UserRec = { token: string; workspaceId?: string; chat?: ChatRec };
 const FILE = process.env.DATA_FILE ?? "./data/users.json";
 let cache: Record<string, UserRec> = {};
 
@@ -18,4 +19,5 @@ function save() {
 export const getUser = (id: number): UserRec | undefined => cache[String(id)];
 export const setToken = (id: number, token: string) => { cache[String(id)] = { ...(cache[String(id)] ?? {}), token }; save(); };
 export const setWorkspace = (id: number, ws: string) => { const u = cache[String(id)]; if (u) { u.workspaceId = ws; save(); } };
+export const setChat = (id: number, chat: ChatRec | undefined) => { const u = cache[String(id)]; if (u) { u.chat = chat; save(); } };
 export const clearUser = (id: number) => { delete cache[String(id)]; save(); };
