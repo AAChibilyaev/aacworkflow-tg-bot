@@ -1,267 +1,285 @@
 #!/usr/bin/env node
 /**
- * AACWorkflow Telegram bot — mobile-first, button-driven.
+ * AACWorkflow Telegram bot — strict, single-panel, mobile-first UX.
  *
- * Multi-tenant: every Telegram user connects their OWN aacworkflow.com token
- * (/login or the 🔑 button) and manages their own tasks & agents. Tokens are
- * stored locally (0600), never shared.
+ * Design rules:
+ *  - One evolving "panel" message per user: navigation edits it in place
+ *    (no message spam). Transient inputs (key, task title) and their prompts
+ *    are removed after use.
+ *  - Chat with an agent is the one exception: it flows as a normal dialogue
+ *    (your message → agent reply) with a typing indicator.
+ *  - Minimal, consistent iconography; clean typography; confirmations for
+ *    destructive actions.
  *
- * UX: inline keyboards (tap, don't type), a persistent reply keyboard, guided
- * prompts for input (new task / key), and in-place message editing.
+ * Multi-tenant: each user connects their OWN aacworkflow.com token.
  */
-import { Bot, InlineKeyboard, Keyboard, type Context } from "grammy";
+import { Bot, InlineKeyboard, type Context } from "grammy";
 import { aac, resolveWorkspace, serverUrl } from "./aac.js";
 import { getUser, setToken, setWorkspace, setChat, clearUser } from "./store.js";
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? "";
-if (!BOT_TOKEN) { console.error("[tg-bot] TELEGRAM_BOT_TOKEN is not set. Create a bot with @BotFather."); process.exit(1); }
-
+if (!BOT_TOKEN) { console.error("[tg-bot] TELEGRAM_BOT_TOKEN is not set."); process.exit(1); }
 const bot = new Bot(BOT_TOKEN);
 
-// Lightweight per-user "awaiting next message" state (lost on restart — fine).
+const PAGE = 6;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const pending = new Map<number, "newtask" | "login">();
+const panelId = new Map<number, number>();   // user → current panel message_id
+const wsName = new Map<string, string>();     // workspace id → name (cache)
 
 const tokenOf = (ctx: Context) => (ctx.from ? getUser(ctx.from.id)?.token ?? null : null);
 const wsOf = (ctx: Context, token: string) => resolveWorkspace(token, ctx.from ? getUser(ctx.from.id)?.workspaceId : undefined);
 
-const homeKb = () =>
-  new InlineKeyboard()
-    .text("📋 Задачи", "m:tasks").text("🤖 Агенты", "m:agents").row()
-    .text("➕ Новая задача", "m:new").text("🏢 Компании", "m:ws").row()
-    .text("👤 Профиль", "m:me").text("🔄 Обновить", "m:home");
+// ── Rendering primitives ────────────────────────────────────────────────
+const md = (s: string) => String(s ?? "").replace(/([_*`\[\]])/g, "\\$1");
+const cut = (s: string, n: number) => (s && s.length > n ? s.slice(0, n - 1) + "…" : s ?? "");
+const err = (e: unknown) => String(e instanceof Error ? e.message : e);
+const dot = (s?: string) => (s === "done" ? "✅" : s === "in_progress" || s === "started" ? "🔵" : s === "cancelled" ? "⚪️" : "🟡");
+const H = (title: string, sub?: string) => `*${md(title)}*` + (sub ? `\n_${md(sub)}_` : "");
 
-const replyKb = () =>
-  new Keyboard().text("📋 Задачи").text("➕ Новая задача").row().text("🤖 Агенты").text("☰ Меню").resized().persistent();
+/** Render the single panel: edit in place on callbacks, else reuse/replace the stored panel. */
+async function panel(ctx: Context, text: string, kb: InlineKeyboard) {
+  const opts = { parse_mode: "Markdown" as const, reply_markup: kb, link_preview_options: { is_disabled: true } };
+  const uid = ctx.from?.id;
+  if (ctx.callbackQuery?.message) {
+    try { const m = await ctx.editMessageText(text, opts); if (uid && typeof m === "object") panelId.set(uid, m.message_id); return; } catch { /* fall through */ }
+  }
+  if (uid && panelId.has(uid)) {
+    try { await ctx.api.editMessageText(uid, panelId.get(uid)!, text, opts); return; } catch { /* stale → send fresh */ }
+  }
+  const m = await ctx.reply(text, opts);
+  if (uid) panelId.set(uid, m.message_id);
+}
 
-const loginKb = () => new InlineKeyboard().text("🔑 Подключить ключ", "m:login");
-
-/** Reply (for commands/typed text) or edit-in-place (for button taps). */
-async function show(ctx: Context, text: string, kb?: InlineKeyboard, edit = false) {
-  const opts = { parse_mode: "Markdown" as const, reply_markup: kb };
+async function workspaceLabel(ctx: Context, token: string): Promise<string> {
   try {
-    if (edit && ctx.callbackQuery) await ctx.editMessageText(text, opts);
-    else await ctx.reply(text, opts);
-  } catch { await ctx.reply(text, opts); }
+    const id = await wsOf(ctx, token);
+    if (wsName.has(id)) return wsName.get(id)!;
+    const data = await aac(token, "GET", "/api/workspaces");
+    const arr: any[] = Array.isArray(data) ? data : data?.workspaces ?? data?.data ?? [];
+    arr.forEach((w) => wsName.set(w.id, w.name));
+    return wsName.get(id) ?? "—";
+  } catch { return "—"; }
 }
 
-const NEED_LOGIN = "Подключи свой ключ AACWorkflow — нажми кнопку ниже или отправь `/login mul_…`.\n\nКлюч: " + serverUrl + " → Settings → Tokens.";
+const backRow = (kb: InlineKeyboard, to = "nav:home", label = "‹ Назад") => kb.text(label, to);
 
-// ── Views (shared by commands and buttons) ──────────────────────────────
-async function viewHome(ctx: Context, edit = false) {
-  if (!tokenOf(ctx)) return show(ctx, "👋 *AACWorkflow*\n\n" + NEED_LOGIN, loginKb(), edit);
-  await show(ctx, "🏠 *Главное меню*\nВыбери действие:", homeKb(), edit);
+// ── Screens ─────────────────────────────────────────────────────────────
+async function home(ctx: Context) {
+  const token = tokenOf(ctx);
+  if (!token) {
+    return panel(ctx, H("AACWorkflow") + "\n\nПодключите ключ доступа, чтобы управлять задачами и агентами.",
+      new InlineKeyboard().text("Подключить ключ", "nav:login"));
+  }
+  const ws = await workspaceLabel(ctx, token);
+  const kb = new InlineKeyboard()
+    .text("Задачи", "nav:tasks:0").text("Агенты", "nav:agents").row()
+    .text("＋ Новая задача", "nav:new").row()
+    .text(`🏢 ${cut(ws, 22)}`, "nav:ws").text("Профиль", "nav:me");
+  await panel(ctx, H("AACWorkflow", ws), kb);
 }
-async function viewTasks(ctx: Context, edit = false) {
-  const token = tokenOf(ctx); if (!token) return viewHome(ctx, edit);
+
+async function tasks(ctx: Context, page = 0) {
+  const token = tokenOf(ctx); if (!token) return home(ctx);
   try {
     const w = await wsOf(ctx, token);
     const data = await aac(token, "GET", "/api/issues", { workspaceId: w });
-    const arr: any[] = Array.isArray(data) ? data : data?.issues ?? data?.data ?? [];
+    const all: any[] = Array.isArray(data) ? data : data?.issues ?? data?.data ?? [];
+    const open = all.filter((i) => i.status !== "done" && i.status !== "cancelled").length;
+    const pages = Math.max(1, Math.ceil(all.length / PAGE));
+    page = Math.min(Math.max(0, page), pages - 1);
+    const slice = all.slice(page * PAGE, page * PAGE + PAGE);
     const kb = new InlineKeyboard();
-    arr.slice(0, 12).forEach((i) => kb.text(`${statusDot(i.status)} ${truncate(i.title, 38)}`, `t:open:${i.id}`).row());
-    kb.text("➕ Новая", "m:new").text("🔄", "m:tasks").row().text("⬅️ Меню", "m:home");
-    await show(ctx, arr.length ? `📋 *Задачи* (${arr.length})` : "📋 Задач нет. Создай новую 👇", kb, edit);
-  } catch (e) { await show(ctx, "⚠️ " + errText(e), homeKb(), edit); }
+    slice.forEach((i) => kb.text(`${dot(i.status)} ${cut(i.title, 40)}`, `task:${i.id}:${page}`).row());
+    if (pages > 1) {
+      const nav: [string, string][] = [];
+      if (page > 0) nav.push(["‹", `nav:tasks:${page - 1}`]);
+      nav.push([`${page + 1}/${pages}`, `nav:tasks:${page}`]);
+      if (page < pages - 1) nav.push(["›", `nav:tasks:${page + 1}`]);
+      nav.forEach(([t, d]) => kb.text(t, d)); kb.row();
+    }
+    kb.text("＋ Новая", "nav:new").text("⟳", `nav:tasks:${page}`).row();
+    backRow(kb);
+    await panel(ctx, H("Задачи", `${all.length} всего · ${open} в работе`) + (all.length ? "" : "\n\nПока пусто."), kb);
+  } catch (e) { await panel(ctx, "⚠️ " + err(e), new InlineKeyboard().text("‹ Назад", "nav:home")); }
 }
-async function viewTask(ctx: Context, id: string, edit = true) {
-  const token = tokenOf(ctx); if (!token) return viewHome(ctx, edit);
+
+async function task(ctx: Context, id: string, back = 0) {
+  const token = tokenOf(ctx); if (!token) return home(ctx);
   try {
     const w = await wsOf(ctx, token);
     const i = await aac(token, "GET", `/api/issues/${id}`, { workspaceId: w });
-    const txt =
-      `${statusDot(i.status)} *${escape(i.title)}*\n` +
-      (i.identifier ? `\`${i.identifier}\`  ` : "") + `статус: ${i.status ?? "?"} · приоритет: ${i.priority ?? "—"}\n\n` +
-      (i.description ? escape(String(i.description)).slice(0, 500) : "_без описания_");
+    const meta = [i.identifier && `\`${md(i.identifier)}\``, `статус: ${i.status ?? "—"}`, `приоритет: ${i.priority ?? "—"}`].filter(Boolean).join("  ·  ");
+    const body = i.description ? "\n\n" + md(String(i.description)).slice(0, 600) : "";
     const kb = new InlineKeyboard();
-    if (i.status !== "done") kb.text("✅ Готово", `t:done:${id}`);
-    kb.text("🔄", `t:open:${id}`).row().text("⬅️ К задачам", "m:tasks");
-    await show(ctx, txt, kb, edit);
-  } catch (e) { await show(ctx, "⚠️ " + errText(e), new InlineKeyboard().text("⬅️ К задачам", "m:tasks"), edit); }
+    if (i.status !== "done") kb.text("✓ Завершить", `done:${id}:${back}`);
+    kb.text("⟳", `task:${id}:${back}`).row();
+    backRow(kb, `nav:tasks:${back}`, "‹ К задачам");
+    await panel(ctx, `${dot(i.status)} *${md(i.title)}*\n${meta}${body}`, kb);
+  } catch (e) { await panel(ctx, "⚠️ " + err(e), new InlineKeyboard().text("‹ К задачам", `nav:tasks:${back}`)); }
 }
-async function viewAgents(ctx: Context, edit = false) {
-  const token = tokenOf(ctx); if (!token) return viewHome(ctx, edit);
+
+async function agents(ctx: Context) {
+  const token = tokenOf(ctx); if (!token) return home(ctx);
   try {
     const w = await wsOf(ctx, token);
     const data = await aac(token, "GET", "/api/agents", { workspaceId: w });
     const arr: any[] = Array.isArray(data) ? data : data?.agents ?? data?.data ?? [];
     const kb = new InlineKeyboard();
-    arr.slice(0, 12).forEach((a) => kb.text(`💬 ${truncate(a.name, 34)}`, `a:chat:${a.id}`).row());
-    kb.text("🔄", "m:agents").text("⬅️ Меню", "m:home");
-    await show(ctx, arr.length ? "🤖 *Агенты* — нажми, чтобы начать чат:" : "🤖 Агентов пока нет.", kb, edit);
-  } catch (e) { await show(ctx, "⚠️ " + errText(e), homeKb(), edit); }
+    arr.slice(0, 12).forEach((a) => kb.text(`💬  ${cut(a.name, 34)}`, `chat:${a.id}`).row());
+    backRow(kb);
+    await panel(ctx, H("Агенты", arr.length ? "Выберите собеседника" : "Агентов пока нет"), kb);
+  } catch (e) { await panel(ctx, "⚠️ " + err(e), new InlineKeyboard().text("‹ Назад", "nav:home")); }
 }
-async function viewWorkspaces(ctx: Context, edit = false) {
-  const token = tokenOf(ctx); if (!token) return viewHome(ctx, edit);
+
+async function workspaces(ctx: Context) {
+  const token = tokenOf(ctx); if (!token) return home(ctx);
   try {
     const data = await aac(token, "GET", "/api/workspaces");
     const arr: any[] = Array.isArray(data) ? data : data?.workspaces ?? data?.data ?? [];
-    const active = ctx.from ? getUser(ctx.from.id)?.workspaceId : undefined;
+    arr.forEach((w) => wsName.set(w.id, w.name));
+    const active = await wsOf(ctx, token).catch(() => "");
     const kb = new InlineKeyboard();
-    arr.forEach((wk) => kb.text(`${active === wk.id ? "✅ " : ""}${truncate(wk.name, 36)}`, `ws:${wk.id}`).row());
-    kb.text("⬅️ Меню", "m:home");
-    await show(ctx, "🏢 *Твои компании* — нажми, чтобы выбрать активную:", kb, edit);
-  } catch (e) { await show(ctx, "⚠️ " + errText(e), homeKb(), edit); }
+    arr.forEach((w) => kb.text(`${active === w.id ? "● " : "○ "}${cut(w.name, 34)}`, `setws:${w.id}`).row());
+    backRow(kb);
+    await panel(ctx, H("Компании", "Активная отмечена ●"), kb);
+  } catch (e) { await panel(ctx, "⚠️ " + err(e), new InlineKeyboard().text("‹ Назад", "nav:home")); }
 }
-async function viewMe(ctx: Context, edit = false) {
-  const token = tokenOf(ctx); if (!token) return viewHome(ctx, edit);
+
+async function me(ctx: Context) {
+  const token = tokenOf(ctx); if (!token) return home(ctx);
   try {
-    const me = await aac(token, "GET", "/api/me");
-    await show(ctx, `👤 *${escape(me?.name ?? "?")}*\n${escape(me?.email ?? "")}`,
-      new InlineKeyboard().text("🚪 Отключить ключ", "m:logout").row().text("⬅️ Меню", "m:home"), edit);
-  } catch (e) { await show(ctx, "⚠️ " + errText(e), homeKb(), edit); }
+    const u = await aac(token, "GET", "/api/me");
+    const ws = await workspaceLabel(ctx, token);
+    const kb = new InlineKeyboard().text("Сменить компанию", "nav:ws").row().text("Отключить ключ", "ask:logout").row().text("‹ Назад", "nav:home");
+    await panel(ctx, H("Профиль") + `\n\n${md(u?.name ?? "—")}\n${md(u?.email ?? "")}\nКомпания: ${md(ws)}`, kb);
+  } catch (e) { await panel(ctx, "⚠️ " + err(e), new InlineKeyboard().text("‹ Назад", "nav:home")); }
 }
 
-// ── Commands (power users keep typing) ──────────────────────────────────
-bot.command("start", (ctx) => viewHome(ctx));
-bot.command("menu", (ctx) => viewHome(ctx));
-bot.command("help", (ctx) =>
-  ctx.reply("*Команды:* /menu, /tasks, /newtask <текст>, /agents, /workspaces, /whoami, /login mul_…, /logout.\nИли просто пользуйся кнопками 👇",
-    { parse_mode: "Markdown", reply_markup: replyKb() }));
-bot.command("tasks", (ctx) => viewTasks(ctx));
-bot.command("agents", (ctx) => viewAgents(ctx));
-bot.command("workspaces", (ctx) => viewWorkspaces(ctx));
-bot.command("whoami", (ctx) => viewMe(ctx));
-bot.command("logout", (ctx) => { if (ctx.from) clearUser(ctx.from.id); return ctx.reply("Ключ удалён.", { reply_markup: loginKb() }); });
-bot.command("login", (ctx) => handleToken(ctx, (ctx.match ?? "").trim()));
-bot.command("newtask", async (ctx) => {
-  const title = (ctx.match ?? "").trim();
-  if (!title) { if (ctx.from) pending.set(ctx.from.id, "newtask"); return ctx.reply("✍️ Напиши текст новой задачи одним сообщением:"); }
-  await createTask(ctx, title);
-});
-bot.command("stop", (ctx) => { if (ctx.from) setChat(ctx.from.id, undefined); return ctx.reply("💬 Чат с агентом завершён.", { reply_markup: replyKb() }); });
-bot.command("use", (ctx) => { const id = (ctx.match ?? "").trim(); if (id && ctx.from) { setWorkspace(ctx.from.id, id); return ctx.reply("✅ Активная компания: `" + id + "`", { parse_mode: "Markdown" }); } return ctx.reply("Лучше выбери кнопкой: /workspaces"); });
+// ── Input prompts (shown inside the panel, no extra messages) ────────────
+async function promptNewTask(ctx: Context) {
+  if (ctx.from) pending.set(ctx.from.id, "newtask");
+  await panel(ctx, H("Новая задача") + "\n\nОтправьте название задачи одним сообщением.", new InlineKeyboard().text("Отмена", "nav:tasks:0"));
+}
+async function promptLogin(ctx: Context) {
+  if (ctx.from) pending.set(ctx.from.id, "login");
+  await panel(ctx, H("Подключение ключа") + `\n\nОтправьте ваш ключ AACWorkflow (\`mul_…\`) одним сообщением.\nКлюч: ${serverUrl} → Settings → Tokens.`,
+    new InlineKeyboard().text("Отмена", "nav:home"));
+}
 
-// ── Reply-keyboard buttons ──────────────────────────────────────────────
-bot.hears("📋 Задачи", (ctx) => viewTasks(ctx));
-bot.hears("🤖 Агенты", (ctx) => viewAgents(ctx));
-bot.hears("☰ Меню", (ctx) => viewHome(ctx));
-bot.hears("➕ Новая задача", (ctx) => { if (ctx.from) pending.set(ctx.from.id, "newtask"); return ctx.reply("✍️ Напиши текст новой задачи одним сообщением:"); });
+// ── Commands ────────────────────────────────────────────────────────────
+bot.command(["start", "menu"], (ctx) => home(ctx));
+bot.command("tasks", (ctx) => tasks(ctx, 0));
+bot.command("agents", (ctx) => agents(ctx));
+bot.command("whoami", (ctx) => me(ctx));
+bot.command("login", (ctx) => { const t = (ctx.match ?? "").trim(); return t ? saveToken(ctx, t) : promptLogin(ctx); });
+bot.command("newtask", (ctx) => { const t = (ctx.match ?? "").trim(); return t ? createTask(ctx, t) : promptNewTask(ctx); });
+bot.command("logout", (ctx) => { if (ctx.from) { clearUser(ctx.from.id); panelId.delete(ctx.from.id); } return home(ctx); });
+bot.command("stop", (ctx) => { if (ctx.from) setChat(ctx.from.id, undefined); return ctx.reply("Чат завершён.").then(() => home(ctx)); });
+bot.command("help", (ctx) => ctx.reply("Управление — кнопками. /menu — открыть меню."));
 
-// ── Inline button taps ──────────────────────────────────────────────────
+// ── Button taps ─────────────────────────────────────────────────────────
 bot.on("callback_query:data", async (ctx) => {
   const d = ctx.callbackQuery.data;
+  const uid = ctx.from?.id;
   try {
-    if (d === "m:home") await viewHome(ctx, true);
-    else if (d === "m:tasks") await viewTasks(ctx, true);
-    else if (d === "m:agents") await viewAgents(ctx, true);
-    else if (d === "m:ws") await viewWorkspaces(ctx, true);
-    else if (d === "m:me") await viewMe(ctx, true);
-    else if (d === "m:login") { if (ctx.from) pending.set(ctx.from.id, "login"); await ctx.reply("🔑 Пришли свой ключ AACWorkflow одним сообщением (`mul_…`).", { parse_mode: "Markdown" }); }
-    else if (d === "m:logout") { if (ctx.from) clearUser(ctx.from.id); await show(ctx, "Ключ удалён.", undefined, true); await ctx.reply("Подключить заново:", { reply_markup: loginKb() }); }
-    else if (d === "m:new") { if (ctx.from) pending.set(ctx.from.id, "newtask"); await ctx.reply("✍️ Напиши текст новой задачи одним сообщением:"); }
-    else if (d.startsWith("t:open:")) await viewTask(ctx, d.slice(7), true);
-    else if (d.startsWith("t:done:")) { await completeTask(ctx, d.slice(7)); await viewTasks(ctx, true); }
-    else if (d.startsWith("ws:")) { if (ctx.from) setWorkspace(ctx.from.id, d.slice(3)); await viewWorkspaces(ctx, true); }
-    else if (d.startsWith("a:chat:")) await startChat(ctx, d.slice(7));
-    else if (d === "m:stop") { if (ctx.from) setChat(ctx.from.id, undefined); await show(ctx, "💬 Чат завершён.", undefined, true); await viewHome(ctx); }
+    if (d === "nav:home") await home(ctx);
+    else if (d.startsWith("nav:tasks:")) await tasks(ctx, Number(d.split(":")[2]) || 0);
+    else if (d === "nav:agents") await agents(ctx);
+    else if (d === "nav:ws") await workspaces(ctx);
+    else if (d === "nav:me") await me(ctx);
+    else if (d === "nav:new") await promptNewTask(ctx);
+    else if (d === "nav:login") await promptLogin(ctx);
+    else if (d.startsWith("task:")) { const [, id, b] = d.split(":"); await task(ctx, id, Number(b) || 0); }
+    else if (d.startsWith("done:")) { const [, id, b] = d.split(":"); await completeTask(ctx, id); await ctx.answerCallbackQuery({ text: "Завершено ✓" }); await tasks(ctx, Number(b) || 0); return; }
+    else if (d.startsWith("setws:")) { if (uid) { setWorkspace(uid, d.slice(6)); } await home(ctx); }
+    else if (d.startsWith("chat:")) await startChat(ctx, d.slice(5));
+    else if (d === "ask:logout") await panel(ctx, H("Отключить ключ") + "\n\nКлюч будет удалён с этого устройства. Продолжить?", new InlineKeyboard().text("Да, отключить", "do:logout").text("Отмена", "nav:me"));
+    else if (d === "do:logout") { if (uid) clearUser(uid); await home(ctx); }
+    else if (d === "chat:exit") { if (uid) setChat(uid, undefined); await home(ctx); }
     await ctx.answerCallbackQuery();
-  } catch (e) { await ctx.answerCallbackQuery({ text: errText(e).slice(0, 190), show_alert: true }); }
+  } catch (e) { try { await ctx.answerCallbackQuery({ text: err(e).slice(0, 190), show_alert: true }); } catch { /* */ } }
 });
 
-// ── Free text → pending action (login / new task). Runs after the above. ─
+// ── Free text → pending input or active chat ─────────────────────────────
 bot.on("message:text", async (ctx) => {
   const id = ctx.from?.id; if (!id) return;
   const act = pending.get(id);
   if (act) {
     pending.delete(id);
-    if (act === "login") return handleToken(ctx, ctx.message.text.trim());
-    if (act === "newtask") return createTask(ctx, ctx.message.text.trim());
+    const text = ctx.message.text.trim();
+    try { await ctx.deleteMessage(); } catch { /* reduce noise / hide secrets */ }
+    if (act === "login") return saveToken(ctx, text);
+    if (act === "newtask") return createTask(ctx, text);
   }
   if (getUser(id)?.chat) return chatSend(ctx, ctx.message.text);
-  return viewHome(ctx);
+  return home(ctx);
 });
 
 // ── Actions ─────────────────────────────────────────────────────────────
-async function handleToken(ctx: Context, token: string) {
-  if (!token.startsWith("mul_")) return ctx.reply("Это не похоже на ключ. Нужен `mul_…`.", { parse_mode: "Markdown", reply_markup: loginKb() });
+async function saveToken(ctx: Context, token: string) {
+  if (!token.startsWith("mul_")) return panel(ctx, H("Подключение ключа") + "\n\nЭто не похоже на ключ. Нужен формат `mul_…`.", new InlineKeyboard().text("Повторить", "nav:login").text("Отмена", "nav:home"));
   try {
-    const me = await aac(token, "GET", "/api/me");
+    await aac(token, "GET", "/api/me");
     if (ctx.from) setToken(ctx.from.id, token);
-    try { await ctx.deleteMessage(); } catch { /* keep token out of history */ }
-    await ctx.reply(`✅ Подключено как *${escape(me?.name ?? me?.email ?? "?")}*.`, { parse_mode: "Markdown", reply_markup: replyKb() });
-    await viewHome(ctx);
-  } catch (e) { await ctx.reply("❌ Ключ не принят: " + errText(e), { reply_markup: loginKb() }); }
+    await home(ctx);
+  } catch (e) { await panel(ctx, H("Подключение ключа") + "\n\n❌ Ключ не принят:\n" + md(err(e)), new InlineKeyboard().text("Повторить", "nav:login")); }
 }
 async function createTask(ctx: Context, title: string) {
-  const token = tokenOf(ctx); if (!token) return viewHome(ctx);
-  if (!title) return ctx.reply("Пустой текст. Попробуй ещё раз кнопкой ➕.");
-  try {
-    const w = await wsOf(ctx, token);
-    const i = await aac(token, "POST", "/api/issues", { workspaceId: w, body: { title } });
-    await ctx.reply(`✅ Создано: *${escape(i?.title ?? title)}*` + (i?.identifier ? ` (${i.identifier})` : ""),
-      { parse_mode: "Markdown", reply_markup: new InlineKeyboard().text("📋 К задачам", "m:tasks") });
-  } catch (e) { await ctx.reply("⚠️ " + errText(e)); }
+  const token = tokenOf(ctx); if (!token) return home(ctx);
+  if (!title) return promptNewTask(ctx);
+  try { await aac(token, "POST", "/api/issues", { workspaceId: await wsOf(ctx, token), body: { title } }); await tasks(ctx, 0); }
+  catch (e) { await panel(ctx, "⚠️ " + err(e), new InlineKeyboard().text("‹ К задачам", "nav:tasks:0")); }
 }
-async function startChat(ctx: Context, agentId: string) {
-  const token = tokenOf(ctx); if (!token) return viewHome(ctx, true);
-  try {
-    const w = await wsOf(ctx, token);
-    let name = "агент";
-    try { const a = await aac(token, "GET", `/api/agents/${agentId}`, { workspaceId: w }); name = a?.name ?? name; } catch { /* ignore */ }
-    const session = await aac(token, "POST", "/api/chat/sessions", { workspaceId: w, body: { agent_id: agentId, title: "Telegram" } });
-    if (ctx.from) setChat(ctx.from.id, { agentId, sessionId: session.id, agentName: name });
-    await show(ctx, `💬 *Чат с ${escape(name)}*\nПиши сообщение — он ответит. /stop — выйти.`, new InlineKeyboard().text("🛑 Выйти из чата", "m:stop"), true);
-  } catch (e) { await show(ctx, "⚠️ " + errText(e), homeKb(), true); }
+async function completeTask(ctx: Context, id: string) {
+  const token = tokenOf(ctx); if (!token) return;
+  await aac(token, "PUT", `/api/issues/${id}`, { workspaceId: await wsOf(ctx, token), body: { status: "done" } });
 }
 
+async function startChat(ctx: Context, agentId: string) {
+  const token = tokenOf(ctx); if (!token) return home(ctx);
+  try {
+    const w = await wsOf(ctx, token);
+    let name = "Агент";
+    try { const a = await aac(token, "GET", `/api/agents/${agentId}`, { workspaceId: w }); name = a?.name ?? name; } catch { /* */ }
+    const s = await aac(token, "POST", "/api/chat/sessions", { workspaceId: w, body: { agent_id: agentId, title: "Telegram" } });
+    if (ctx.from) setChat(ctx.from.id, { agentId, sessionId: s.id, agentName: name });
+    await panel(ctx, `💬 *${md(name)}*\n_Напишите сообщение. /stop — выйти._`, new InlineKeyboard().text("‹ Выйти из чата", "chat:exit"));
+  } catch (e) { await panel(ctx, "⚠️ " + err(e), new InlineKeyboard().text("‹ Назад", "nav:home")); }
+}
 async function chatSend(ctx: Context, text: string) {
   const id = ctx.from?.id; const u = id ? getUser(id) : undefined;
-  if (!u?.chat || !u.token) return viewHome(ctx);
-  const { token } = u; const chat = u.chat;
+  if (!u?.chat || !u.token) return home(ctx);
+  const { token } = u; const chat = u.chat; const w = await wsOf(ctx, token);
   let since = new Date().toISOString();
-  try {
-    const send = await aac(token, "POST", `/api/chat/sessions/${chat.sessionId}/messages`, { workspaceId: await wsOf(ctx, token), body: { content: text } });
-    if (send?.created_at) since = send.created_at;
-  } catch (e) { await ctx.reply("⚠️ " + errText(e)); return; }
-  const thinking = await ctx.reply(`⏳ ${chat.agentName} печатает…`);
-  const w = await wsOf(ctx, token);
+  try { const send = await aac(token, "POST", `/api/chat/sessions/${chat.sessionId}/messages`, { workspaceId: w, body: { content: text } }); if (send?.created_at) since = send.created_at; }
+  catch (e) { await ctx.reply("⚠️ " + err(e)); return; }
   for (let i = 0; i < 40; i++) {
+    try { await ctx.api.sendChatAction(ctx.chat!.id, "typing"); } catch { /* */ }
     await sleep(2500);
     try {
       const msgs = await aac(token, "GET", `/api/chat/sessions/${chat.sessionId}/messages`, { workspaceId: w });
       const arr: any[] = Array.isArray(msgs) ? msgs : [];
       const fresh = arr.filter((m) => m.role === "assistant" && (m.created_at ?? "") > since && (m.content ?? "").trim());
       const failed = arr.find((m) => m.failure_reason && (m.created_at ?? "") >= since);
-      if (fresh.length) {
-        const reply = fresh.map((m) => m.content).join("\n\n").slice(0, 3800);
-        await ctx.api.editMessageText(thinking.chat.id, thinking.message_id, `🤖 ${chat.agentName}:\n\n${reply}`);
-        return;
-      }
-      if (failed) { await ctx.api.editMessageText(thinking.chat.id, thinking.message_id, "⚠️ Агент не смог ответить: " + (failed.failure_reason ?? "")); return; }
+      if (fresh.length) { await ctx.reply(fresh.map((m) => m.content).join("\n\n").slice(0, 4000)); return; }
+      if (failed) { await ctx.reply("⚠️ Агент не смог ответить: " + (failed.failure_reason ?? "")); return; }
     } catch { /* keep polling */ }
   }
-  await ctx.api.editMessageText(thinking.chat.id, thinking.message_id, "⌛ Агент пока не ответил. Напиши ещё раз или /stop.");
+  await ctx.reply("⌛ Агент пока не ответил. Напишите ещё раз или /stop.");
 }
 
-async function completeTask(ctx: Context, id: string) {
-  const token = tokenOf(ctx); if (!token) return;
-  const w = await wsOf(ctx, token);
-  await aac(token, "PUT", `/api/issues/${id}`, { workspaceId: w, body: { status: "done" } });
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────────
-const truncate = (s: string, n: number) => (s && s.length > n ? s.slice(0, n - 1) + "…" : s ?? "");
-const escape = (s: string) => String(s ?? "").replace(/([_*`\[])/g, "\\$1");
-const errText = (e: unknown) => String(e instanceof Error ? e.message : e);
-function statusDot(s?: string) {
-  return s === "done" ? "✅" : s === "in_progress" || s === "started" ? "🔵" : s === "cancelled" ? "⚪️" : "🟡";
-}
-
-bot.catch((err) => console.error("[tg-bot] error:", err.error));
+bot.catch((e) => console.error("[tg-bot] error:", e.error));
 
 await bot.api.setMyCommands([
-  { command: "menu", description: "Главное меню" },
-  { command: "tasks", description: "Мои задачи" },
-  { command: "newtask", description: "Создать задачу" },
-  { command: "agents", description: "Мои агенты" },
-  { command: "workspaces", description: "Мои компании" },
+  { command: "menu", description: "Меню" },
+  { command: "tasks", description: "Задачи" },
+  { command: "agents", description: "Агенты" },
+  { command: "newtask", description: "Новая задача" },
   { command: "whoami", description: "Профиль" },
-  { command: "login", description: "Подключить ключ" },
+  { command: "stop", description: "Выйти из чата" },
   { command: "logout", description: "Отключить ключ" },
 ]);
 await bot.api.setChatMenuButton({ menu_button: { type: "commands" } });
-
 console.error("[tg-bot] starting (long polling) →", serverUrl);
 await bot.start();
